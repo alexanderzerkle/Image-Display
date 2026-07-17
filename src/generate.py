@@ -331,40 +331,115 @@ def merged_anchor_map(
     return covered, spans
 
 
+def fit_single_line(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    width: int,
+) -> str:
+    """Fit one line inside the available width, adding an ellipsis if needed."""
+
+    text = text.replace("\r", " ").replace("\n", " ").strip()
+
+    if not text:
+        return ""
+
+    if draw.textlength(text, font=font) <= width:
+        return text
+
+    ellipsis = "..."
+    shortened = text
+
+    while (
+        shortened
+        and draw.textlength(
+            shortened + ellipsis,
+            font=font,
+        ) > width
+    ):
+        shortened = shortened[:-1]
+
+    return shortened.rstrip() + ellipsis if shortened else ellipsis
+
+
 def wrap_text(
     draw: ImageDraw.ImageDraw,
     text: str,
     font: ImageFont.ImageFont,
     width: int,
     max_lines: int,
+    allow_wrap: bool,
 ) -> list[str]:
-    """Wrap text to the available cell width and truncate excess lines."""
+    """
+    Fit text into a cell.
 
-    text = str(text).replace("\r", "").strip()
+    Explicit line breaks are always preserved. Automatic word wrapping is
+    performed only when Excel's Wrap Text setting is enabled.
+    """
+
+    text = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
 
     if not text:
         return []
 
+    paragraphs = text.split("\n")
     lines: list[str] = []
 
-    for paragraph in text.split("\n"):
+    for paragraph in paragraphs:
+        if not allow_wrap:
+            lines.append(
+                fit_single_line(
+                    draw,
+                    paragraph,
+                    font,
+                    width,
+                )
+            )
+            continue
+
         words = paragraph.split()
+
+        if not words:
+            lines.append("")
+            continue
+
         current = ""
 
-        for word in words or [""]:
-            candidate = (
-                word
-                if not current
-                else f"{current} {word}"
-            )
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
 
             if draw.textlength(candidate, font=font) <= width:
                 current = candidate
-            else:
-                if current:
-                    lines.append(current)
+                continue
 
-                current = word
+            if current:
+                lines.append(current)
+                current = ""
+
+            # Break a single word that is wider than the cell.
+            remaining = word
+
+            while remaining:
+                chunk = ""
+
+                while (
+                    remaining
+                    and draw.textlength(
+                        chunk + remaining[0],
+                        font=font,
+                    ) <= width
+                ):
+                    chunk += remaining[0]
+                    remaining = remaining[1:]
+
+                if not chunk:
+                    chunk = remaining[0]
+                    remaining = remaining[1:]
+
+                if remaining:
+                    lines.append(chunk)
+                else:
+                    current = chunk
 
         if current:
             lines.append(current)
@@ -507,6 +582,71 @@ def draw_simple_border(
         )
 
 
+def draw_text_underline(
+    draw: ImageDraw.ImageDraw,
+    font,
+    underline_style: str | None,
+    text_x: float,
+    text_y: float,
+    text_width: float,
+    line_height: int,
+    cell_left: int,
+    cell_right: int,
+    padding: int,
+    color: tuple[int, int, int],
+) -> None:
+    """Draw Excel-style font underlines beneath a rendered line of text."""
+
+    if not underline_style:
+        return
+
+    style = str(underline_style)
+
+    is_double = style in {
+        "double",
+        "doubleAccounting",
+    }
+
+    is_accounting = style in {
+        "singleAccounting",
+        "doubleAccounting",
+    }
+
+    if is_accounting:
+        start_x = cell_left + padding
+        end_x = cell_right - padding
+    else:
+        start_x = round(text_x)
+        end_x = round(text_x + text_width)
+
+    # Place the underline near the font baseline rather than at the very
+    # bottom of the cell.
+    ascent, _descent = font.getmetrics()
+    underline_y = round(text_y + min(ascent + 1, line_height - 2))
+
+    draw.line(
+        (
+            start_x,
+            underline_y,
+            end_x,
+            underline_y,
+        ),
+        fill=color,
+        width=1,
+    )
+
+    if is_double:
+        draw.line(
+            (
+                start_x,
+                underline_y + 2,
+                end_x,
+                underline_y + 2,
+            ),
+            fill=color,
+            width=1,
+        )
+
 def draw_cell_text(
     draw: ImageDraw.ImageDraw,
     cell,
@@ -568,7 +708,7 @@ def draw_cell_text(
 
     line_height = max(
         1,
-        line_bbox[3] - line_bbox[1] + 2,
+        line_bbox[3] - line_bbox[1] + 3,
     )
 
     max_lines = max(
@@ -576,12 +716,18 @@ def draw_cell_text(
         available_height // line_height,
     )
 
+    raw_text = str(value)
+
+    # Excel supports both automatic wrapping and manually inserted line breaks.
+    allow_wrap = bool(alignment.wrap_text) or "\n" in raw_text or "\r" in raw_text
+
     lines = wrap_text(
         draw,
-        str(value),
+        raw_text,
         font,
         available_width,
         max_lines,
+        allow_wrap,
     )
 
     if not lines:
@@ -601,6 +747,7 @@ def draw_cell_text(
         ) // 2
 
     horizontal = alignment.horizontal or "left"
+    underline_style = getattr(cell.font, "underline", None)
 
     for line in lines:
         line_width = draw.textlength(
@@ -625,6 +772,20 @@ def draw_cell_text(
             line,
             font=font,
             fill=color,
+        )
+
+        draw_text_underline(
+            draw=draw,
+            font=font,
+            underline_style=underline_style,
+            text_x=x,
+            text_y=y,
+            text_width=line_width,
+            line_height=line_height,
+            cell_left=left,
+            cell_right=right,
+            padding=padding,
+            color=color,
         )
 
         y += line_height
@@ -728,34 +889,7 @@ def render_png(
                 background,
             )
 
-    # Add a light grid to cells that have no explicit borders.
-    grid = (190, 190, 190)
 
-    for x in col_edges:
-        draw.line(
-            (
-                x,
-                MARGIN,
-                x,
-                HEIGHT - MARGIN,
-            ),
-            fill=grid,
-            width=1,
-        )
-
-    for y in row_edges:
-        draw.line(
-            (
-                MARGIN,
-                y,
-                WIDTH - MARGIN,
-                y,
-            ),
-            fill=grid,
-            width=1,
-        )
-
-    # Re-draw explicit borders so they appear above the light grid.
     for row in range(1, max_row + 1):
         for col in range(1, max_col + 1):
             if (row, col) in covered:
