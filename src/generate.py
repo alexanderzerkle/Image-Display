@@ -37,7 +37,7 @@ MARGIN = 10
 DEFAULT_ROW_HEIGHT = 22.0
 DEFAULT_COLUMN_WIDTH = 10.0
 
-MIN_FONT_SIZE = 6
+MIN_FONT_SIZE = 9
 MAX_FONT_SIZE = 32
 
 
@@ -279,19 +279,24 @@ def natural_edges(
     return edges
 
 
-def worksheet_scale(
+def worksheet_scales(
     row_sizes: list[float],
     col_sizes: list[float],
-) -> float:
-    """Fit the sheet into the canvas without enlarging it unnecessarily."""
+) -> tuple[float, float]:
+    """Scale columns and rows separately to use the 800x480 canvas.
+
+    Google Sheets itself displays column widths and row heights using different
+    screen conversions.  A single uniform scale made wide sheets force the
+    rows and fonts to become far too small.  Independent axes preserve the
+    spreadsheet-like density while fitting the useful range to the image.
+    """
 
     natural_width = sum(col_sizes) or 1.0
     natural_height = sum(row_sizes) or 1.0
     available_width = WIDTH - 2 * MARGIN
     available_height = HEIGHT - 2 * MARGIN
 
-    return min(
-        1.0,
+    return (
         available_width / natural_width,
         available_height / natural_height,
     )
@@ -821,9 +826,10 @@ def render_png(
         for col in range(1, max_col + 1)
     ]
 
-    scale = worksheet_scale(row_sizes, col_sizes)
-    row_edges = natural_edges(row_sizes, MARGIN, scale)
-    col_edges = natural_edges(col_sizes, MARGIN, scale)
+    x_scale, y_scale = worksheet_scales(row_sizes, col_sizes)
+    row_edges = natural_edges(row_sizes, MARGIN, y_scale)
+    col_edges = natural_edges(col_sizes, MARGIN, x_scale)
+    font_scale = y_scale
 
     covered, spans = merged_anchor_map(
         sheet,
@@ -882,7 +888,7 @@ def render_png(
                 background,
                 col_edges,
                 max_col,
-                scale,
+                font_scale,
             )
 
 
