@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a published Google Sheet XLSX workbook as an 800x480 PNG."""
+"""Render a 40x24 Google Sheet XLSX range as an exact 800x480 PNG."""
 
 from __future__ import annotations
 
@@ -27,12 +27,14 @@ SHEET_XLSX_URL = os.environ.get(
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "dist"))
 WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "").strip()
 
-MAX_ROWS = int(os.environ.get("MAX_ROWS", "40"))
-MAX_COLUMNS = int(os.environ.get("MAX_COLUMNS", "20"))
+MAX_ROWS = int(os.environ.get("MAX_ROWS", "24"))
+MAX_COLUMNS = int(os.environ.get("MAX_COLUMNS", "40"))
 
 WIDTH = 800
 HEIGHT = 480
-MARGIN = 10
+CELL_WIDTH = 20
+CELL_HEIGHT = 20
+FONT_PIXEL_SCALE = 96.0 / 72.0
 
 DEFAULT_ROW_HEIGHT = 22.0
 DEFAULT_COLUMN_WIDTH = 10.0
@@ -508,48 +510,29 @@ def draw_checkbox(
     checked: bool,
     color: tuple[int, int, int],
 ) -> None:
-    """Draw a checked or unchecked box for Boolean cells."""
+    """Draw every Boolean cell as the same 16x16 checkbox."""
 
     left, top, right, bottom = box
-
-    size = max(
-        6,
-        min(
-            18,
-            right - left - 4,
-            bottom - top - 4,
-        ),
-    )
-
+    size = 16
     x = left + (right - left - size) // 2
     y = top + (bottom - top - size) // 2
 
-    draw.rectangle(
-        (
-            x,
-            y,
-            x + size,
-            y + size,
-        ),
-        outline=color,
-        width=2,
-    )
+    draw.rectangle((x, y, x + size - 1, y + size - 1), outline=color, width=2)
 
     if checked:
         draw.line(
             (
-                x + round(size * 0.20),
-                y + round(size * 0.55),
-                x + round(size * 0.43),
-                y + round(size * 0.78),
-                x + round(size * 0.82),
-                y + round(size * 0.25),
+                x + 3,
+                y + 8,
+                x + 7,
+                y + 12,
+                x + 13,
+                y + 4,
             ),
             fill=color,
-            width=max(2, size // 7),
+            width=2,
             joint="curve",
         )
-
 
 def draw_simple_border(
     draw: ImageDraw.ImageDraw,
@@ -710,7 +693,7 @@ def draw_cell_text(
         return
 
     left, top, right, bottom = box
-    padding = max(2, round(4 * scale))
+    padding = 3
 
     alignment: Alignment = cell.alignment or Alignment()
     raw_text = str(value)
@@ -728,7 +711,7 @@ def draw_cell_text(
     available_width = max(1, text_right - left - padding * 2)
     available_height = max(1, bottom - top - padding * 2)
 
-    size = float(cell.font.sz or 11) * scale
+    size = float(cell.font.sz or 11) * FONT_PIXEL_SCALE
     font = load_font(
         size,
         bool(cell.font.bold),
@@ -737,7 +720,7 @@ def draw_cell_text(
 
     color = text_color(cell, background)
     line_bbox = draw.textbbox((0, 0), "Ag", font=font)
-    line_height = max(1, line_bbox[3] - line_bbox[1] + max(1, round(2 * scale)))
+    line_height = max(1, line_bbox[3] - line_bbox[1] + 2)
     max_lines = max(1, available_height // line_height)
 
     lines = wrap_text(
@@ -797,12 +780,9 @@ def render_png(
     workbook_bytes: bytes,
     output_path: Path,
 ) -> None:
-    """Load the workbook and render its selected worksheet."""
+    """Render the first 40 columns and 24 rows on an exact 20px grid."""
 
-    workbook = load_workbook(
-        io.BytesIO(workbook_bytes),
-        data_only=True,
-    )
+    workbook = load_workbook(io.BytesIO(workbook_bytes), data_only=True)
 
     if WORKSHEET_NAME:
         if WORKSHEET_NAME not in workbook.sheetnames:
@@ -810,127 +790,78 @@ def render_png(
                 f"Worksheet {WORKSHEET_NAME!r} was not found. "
                 f"Available sheets: {workbook.sheetnames}"
             )
-
         sheet = workbook[WORKSHEET_NAME]
     else:
         sheet = workbook.active
 
-    max_row, max_col = used_bounds(sheet)
+    max_row = min(MAX_ROWS, HEIGHT // CELL_HEIGHT)
+    max_col = min(MAX_COLUMNS, WIDTH // CELL_WIDTH)
 
-    row_sizes = [
-        row_height_pixels(sheet, row)
-        for row in range(1, max_row + 1)
-    ]
-    col_sizes = [
-        column_width_pixels(sheet, col)
-        for col in range(1, max_col + 1)
-    ]
+    # These edges exactly match the requested 40 x 24 sheet geometry.
+    col_edges = [column * CELL_WIDTH for column in range(max_col + 1)]
+    row_edges = [row * CELL_HEIGHT for row in range(max_row + 1)]
 
-    x_scale, y_scale = worksheet_scales(row_sizes, col_sizes)
-    row_edges = natural_edges(row_sizes, MARGIN, y_scale)
-    col_edges = natural_edges(col_sizes, MARGIN, x_scale)
-    font_scale = y_scale
+    covered, spans = merged_anchor_map(sheet, max_row, max_col)
 
-    covered, spans = merged_anchor_map(
-        sheet,
-        max_row,
-        max_col,
-    )
-
-    image = Image.new(
-        "RGB",
-        (WIDTH, HEIGHT),
-        (255, 255, 255),
-    )
-
+    image = Image.new("RGB", (WIDTH, HEIGHT), (255, 255, 255))
     draw = ImageDraw.Draw(image)
 
+    def cell_box(row: int, col: int) -> tuple[int, int, int, int]:
+        start_row, start_col, end_row, end_col = spans.get(
+            (row, col),
+            (row, col, row, col),
+        )
+        return (
+            col_edges[start_col - 1],
+            row_edges[start_row - 1],
+            col_edges[end_col],
+            row_edges[end_row],
+        )
+
+    # Pass 1: paint all cell fills first. This is important because text from a
+    # cell may visually overflow across blank cells, just as it does in Sheets.
     for row in range(1, max_row + 1):
         for col in range(1, max_col + 1):
             if (row, col) in covered:
                 continue
-
             cell = sheet.cell(row, col)
-
             if isinstance(cell, MergedCell):
                 continue
+            draw.rectangle(cell_box(row, col), fill=fill_rgb(cell.fill))
 
-            start_row, start_col, end_row, end_col = spans.get(
-                (row, col),
-                (row, col, row, col),
-            )
-
-            box = (
-                col_edges[start_col - 1],
-                row_edges[start_row - 1],
-                col_edges[end_col],
-                row_edges[end_row],
-            )
-
-            background = fill_rgb(cell.fill)
-
-            draw.rectangle(
-                box,
-                fill=background,
-            )
-
-            draw_simple_border(
-                draw,
-                cell.border,
-                box,
-            )
-
+    # Pass 2: draw text and checkboxes after every background has been painted,
+    # so adjacent blank cells cannot erase overflowing text.
+    for row in range(1, max_row + 1):
+        for col in range(1, max_col + 1):
+            if (row, col) in covered:
+                continue
+            cell = sheet.cell(row, col)
+            if isinstance(cell, MergedCell):
+                continue
+            box = cell_box(row, col)
             draw_cell_text(
                 draw,
                 sheet,
                 cell,
                 box,
-                background,
+                fill_rgb(cell.fill),
                 col_edges,
                 max_col,
-                font_scale,
+                1.0,
             )
 
-
+    # Pass 3: explicit spreadsheet borders only. No artificial grid is added.
     for row in range(1, max_row + 1):
         for col in range(1, max_col + 1):
             if (row, col) in covered:
                 continue
-
             cell = sheet.cell(row, col)
-
             if isinstance(cell, MergedCell):
                 continue
+            draw_simple_border(draw, cell.border, cell_box(row, col))
 
-            start_row, start_col, end_row, end_col = spans.get(
-                (row, col),
-                (row, col, row, col),
-            )
-
-            box = (
-                col_edges[start_col - 1],
-                row_edges[start_row - 1],
-                col_edges[end_col],
-                row_edges[end_row],
-            )
-
-            draw_simple_border(
-                draw,
-                cell.border,
-                box,
-            )
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    image.save(
-        output_path,
-        format="PNG",
-        optimize=True,
-    )
-
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path, format="PNG", optimize=True)
 
 def write_index(output_dir: Path) -> None:
     """Create the simple GitHub Pages wrapper page."""
