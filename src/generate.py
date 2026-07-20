@@ -62,7 +62,7 @@ FONT_FAMILIES = {
 def download_xlsx(url: str) -> bytes:
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "github-pages-sheet-renderer/4.0"},
+        headers={"User-Agent": "github-pages-sheet-renderer/4.1-no-ellipsis"},
     )
     with urllib.request.urlopen(request, timeout=45) as response:
         data = response.read()
@@ -218,14 +218,9 @@ def overflow_box(sheet, row: int, col: int, base_box: tuple[int, int, int, int],
 
 
 def fit_single_line(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, width: int) -> str:
-    text = text.replace("\r", " ").replace("\n", " ").strip()
-    if not text or draw.textlength(text, font=font) <= width:
-        return text
-    ellipsis = "..."
-    shortened = text
-    while shortened and draw.textlength(shortened + ellipsis, font=font) > width:
-        shortened = shortened[:-1]
-    return shortened.rstrip() + ellipsis if shortened else ellipsis
+    """Return the full single-line text without truncation or ellipses."""
+    del draw, font, width
+    return text.replace("\r", " ").replace("\n", " ").strip()
 
 
 def wrap_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, width: int, max_lines: int) -> list[str]:
@@ -247,10 +242,9 @@ def wrap_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, 
                 current = word
         if current:
             lines.append(current)
-    if len(lines) <= max_lines:
-        return lines
-    lines = lines[:max_lines]
-    lines[-1] = fit_single_line(draw, lines[-1], font, width)
+    # Do not truncate wrapped text or add ellipses. Pillow does not clip text to
+    # the source cell, so extra lines may overlap content below, as requested.
+    del max_lines
     return lines
 
 
@@ -276,7 +270,35 @@ def draw_underline(draw: ImageDraw.ImageDraw, font: ImageFont.ImageFont, style: 
         draw.line((round(x), line_y + 2, round(x + width), line_y + 2), fill=color, width=1)
 
 
-def draw_cell_text(draw: ImageDraw.ImageDraw, sheet, cell, box: tuple[int, int, int, int], covered: set[tuple[int, int]], merged: bool) -> None:
+def draw_rotated_text(
+    image: Image.Image,
+    text: str,
+    font: ImageFont.ImageFont,
+    color: tuple[int, int, int],
+    x: int,
+    y: int,
+    angle: int,
+    underline: str | None,
+) -> None:
+    """Draw full text at an Excel rotation angle without clipping."""
+    scratch = Image.new("RGBA", (max(WIDTH, 1600), max(HEIGHT, 800)), (255, 255, 255, 0))
+    scratch_draw = ImageDraw.Draw(scratch)
+    scratch_draw.text((2, 2), text, font=font, fill=(*color, 255))
+    if underline:
+        text_width = scratch_draw.textlength(text, font=font)
+        ascent, _ = font.getmetrics()
+        underline_y = 2 + ascent + 1
+        scratch_draw.line((2, underline_y, 2 + text_width, underline_y), fill=(*color, 255), width=1)
+        if str(underline) in {"double", "doubleAccounting"}:
+            scratch_draw.line((2, underline_y + 2, 2 + text_width, underline_y + 2), fill=(*color, 255), width=1)
+    bbox = scratch.getbbox()
+    if bbox is None:
+        return
+    glyph = scratch.crop(bbox).rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
+    image.alpha_composite(glyph, (x, y))
+
+
+def draw_cell_text(image: Image.Image, draw: ImageDraw.ImageDraw, sheet, cell, box: tuple[int, int, int, int], covered: set[tuple[int, int]], merged: bool) -> None:
     value = cell.value
     if value in (None, ""):
         return
@@ -291,8 +313,15 @@ def draw_cell_text(draw: ImageDraw.ImageDraw, sheet, cell, box: tuple[int, int, 
     wrap = bool(alignment.wrap_text) or "\n" in str(value) or "\r" in str(value)
 
     text_box = box
-    if not wrap and not merged and (alignment.horizontal or "general") not in {"right", "center", "centerContinuous"}:
-        text_box = overflow_box(sheet, cell.row, cell.column, box, covered)
+    if not wrap and not merged:
+        horizontal_mode = alignment.horizontal or "general"
+        if horizontal_mode not in {"right", "center", "centerContinuous"}:
+            # Let left-aligned text continue all the way to the image edge.
+            # It is intentionally allowed to overlap cells, borders, and text.
+            text_box = (box[0], box[1], WIDTH, box[3])
+        elif horizontal_mode == "right":
+            # Likewise, allow right-aligned text to extend toward the left edge.
+            text_box = (0, box[1], box[2], box[3])
 
     left, top, right, bottom = text_box
     available_width = max(1, right - left - 2 * TEXT_PADDING_X)
@@ -316,6 +345,19 @@ def draw_cell_text(draw: ImageDraw.ImageDraw, sheet, cell, box: tuple[int, int, 
 
     horizontal = alignment.horizontal or "left"
     underline = getattr(cell.font, "underline", None)
+    rotation = int(getattr(alignment, "textRotation", 0) or 0)
+
+    # Excel stores ordinary vertical text as 90 degrees. Render the complete
+    # value rather than forcing it through the horizontal cell-width logic.
+    if rotation not in (0, 255):
+        angle = rotation if rotation <= 90 else rotation - 180
+        x = box[0] + 2
+        y = box[1] + 1
+        rgba = image.convert("RGBA")
+        draw_rotated_text(rgba, str(value), font, color, x, y, angle, underline)
+        image.paste(rgba.convert("RGB"))
+        return
+
     for line in lines:
         line_width = draw.textlength(line, font=font)
         if horizontal in {"center", "centerContinuous"}:
@@ -364,7 +406,7 @@ def render_png(workbook_bytes: bytes, output_path: Path) -> None:
                 continue
             start_row, start_col, end_row, end_col = spans.get((row, col), (row, col, row, col))
             box = cell_box(start_row, start_col, end_row, end_col)
-            draw_cell_text(draw, sheet, cell, box, covered, (row, col) in spans)
+            draw_cell_text(image, draw, sheet, cell, box, covered, (row, col) in spans)
 
     # Explicit workbook borders are drawn last. No artificial grid is added.
     for row in range(1, ROWS + 1):
